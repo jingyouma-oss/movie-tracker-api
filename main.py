@@ -41,6 +41,33 @@ def get_books(status: Optional[str] = None):
     return books_db
 
 
+@app.get("/books/stats")
+def get_stats():
+    total = len(books_db)
+    reading = sum(1 for book in books_db if book["status"] == "reading")
+    read = sum(1 for book in books_db if book["status"] == "read")
+    want_to_read = sum(1 for book in books_db if book["status"] == "want_to_read")
+
+    read_ratings = [
+        book["rating"]
+        for book in books_db
+        if book["status"] == "read" and book["rating"] is not None
+    ]
+    average_rating = (
+        sum(read_ratings) / len(read_ratings) if read_ratings else None
+    )
+
+    return {
+        "total_books": total,
+        "by_status": {
+            "reading": reading,
+            "read": read,
+            "want_to_read": want_to_read,
+        },
+        "average_rating_for_read_books": average_rating,
+    }
+
+
 @app.get("/books/{book_id}")
 def get_book(book_id: int):
     for book in books_db:
