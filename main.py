@@ -1,13 +1,17 @@
 from contextlib import asynccontextmanager
 
+import anthropic
 from fastapi import Depends, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
+from pydantic import ValidationError
+
 from database import Base, SessionLocal, engine, get_db
 from models import Movie, Review
 from schemas import (
+    ChatRequest,
     MovieCreate,
     MovieDetailResponse,
     MovieResponse,
@@ -18,6 +22,19 @@ from schemas import (
 
 
 Base.metadata.create_all(bind=engine)
+ai_client = anthropic.Anthropic()
+
+GENERAL_SYSTEM_PROMPT = """You are a helpful movie assistant for a personal movie tracking app.
+Help users discuss movies they have watched, explore genres, compare directors, and discover what to watch next.
+Be conversational, enthusiastic about movies, and concise in your responses."""
+
+RECOMMENDATION_PROMPT_TEMPLATE = """You are a personalized movie recommendation assistant.
+
+{movie_context}
+
+Based on this viewing history, provide thoughtful and specific recommendations.
+Explain why each recommendation matches their taste.
+Keep responses concise and give 2-3 recommendations unless asked for more."""
 
 
 def seed_database():
@@ -146,6 +163,63 @@ def health():
     return {"status": "ok"}
 
 
+def ensure_ai_key():
+    if not ai_client.api_key:
+        raise HTTPException(
+            status_code=500,
+            detail="ANTHROPIC_API_KEY is missing. Add it to the backend .env file before using AI features.",
+        )
+
+
+def build_history_payload(request: ChatRequest) -> list[dict[str, str]]:
+    try:
+        history = [message.model_dump() for message in request.conversation_history]
+    except ValidationError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return history + [{"role": "user", "content": request.message}]
+
+
+def request_claude_reply(messages: list[dict[str, str]], system_prompt: str) -> str:
+    ensure_ai_key()
+    response = ai_client.messages.create(
+        model="claude-sonnet-4-20250514",
+        max_tokens=1024,
+        system=system_prompt,
+        messages=messages,
+    )
+    return response.content[0].text
+
+
+def build_movie_context(db: Session) -> str:
+    movies = db.query(Movie).order_by(Movie.rating.desc().nullslast(), Movie.id.asc()).all()
+    watched_movies = [movie for movie in movies if movie.status == "watched"]
+    watching_movies = [movie for movie in movies if movie.status == "watching"]
+    want_to_watch = [movie for movie in movies if movie.status == "want_to_watch"]
+
+    context = "Here is the user's movie library:\n"
+
+    if watched_movies:
+        context += "\nWatched movies:\n"
+        for movie in watched_movies:
+            rating_str = f" (rated {movie.rating}/5)" if movie.rating else ""
+            context += f"- {movie.title} directed by {movie.director}, {movie.genre}, {movie.release_year}{rating_str}\n"
+
+    if watching_movies:
+        context += "\nCurrently watching:\n"
+        for movie in watching_movies:
+            context += f"- {movie.title} directed by {movie.director}, {movie.genre}, {movie.release_year}\n"
+
+    if want_to_watch:
+        context += "\nWant to watch:\n"
+        for movie in want_to_watch:
+            context += f"- {movie.title} directed by {movie.director}, {movie.genre}, {movie.release_year}\n"
+
+    if not movies:
+        context += "No movies tracked yet.\n"
+
+    return context
+
+
 @app.get("/movies", response_model=list[MovieResponse])
 def get_movies(status: str | None = None, genre: str | None = None, db: Session = Depends(get_db)):
     query = db.query(Movie)
@@ -248,3 +322,26 @@ def delete_review(review_id: int, db: Session = Depends(get_db)):
     db.delete(review)
     db.commit()
     return {"message": f"Review {review_id} deleted"}
+
+
+@app.post("/ai/chat")
+def chat_with_assistant(request: ChatRequest):
+    messages = build_history_payload(request)
+    reply = request_claude_reply(messages, GENERAL_SYSTEM_PROMPT)
+    return {
+        "reply": reply,
+        "updated_history": messages + [{"role": "assistant", "content": reply}],
+    }
+
+
+@app.post("/ai/recommend")
+def get_recommendations(request: ChatRequest, db: Session = Depends(get_db)):
+    messages = build_history_payload(request)
+    system_prompt = RECOMMENDATION_PROMPT_TEMPLATE.format(
+        movie_context=build_movie_context(db)
+    )
+    reply = request_claude_reply(messages, system_prompt)
+    return {
+        "reply": reply,
+        "updated_history": messages + [{"role": "assistant", "content": reply}],
+    }

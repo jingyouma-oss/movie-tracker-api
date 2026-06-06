@@ -51,3 +51,13 @@ class MovieResponse(BaseModel):
 
 class MovieDetailResponse(MovieResponse):
     reviews: list[ReviewResponse]
+
+
+class ChatMessage(BaseModel):
+    role: str
+    content: str
+
+
+class ChatRequest(BaseModel):
+    message: str
+    conversation_history: list[ChatMessage] = []
