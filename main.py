@@ -11,6 +11,7 @@ from pydantic import ValidationError
 from database import Base, SessionLocal, engine, get_db
 from models import Movie, Review
 from schemas import (
+    AgentRequest,
     ChatRequest,
     MovieCreate,
     MovieDetailResponse,
@@ -35,6 +36,115 @@ RECOMMENDATION_PROMPT_TEMPLATE = """You are a personalized movie recommendation 
 Based on this viewing history, provide thoughtful and specific recommendations.
 Explain why each recommendation matches their taste.
 Keep responses concise and give 2-3 recommendations unless asked for more."""
+
+AGENT_SYSTEM_PROMPT = """You are an AI agent for a personal movie tracker.
+You can look up movies, add new ones, update a movie's status and rating, and delete movies.
+Use tools whenever you need to inspect or change the saved collection.
+Do not guess which movies are in the tracker when you can check with a tool first.
+If a request refers to a movie indirectly, use the tools to identify the correct movie before taking action.
+After using tools, give a clear and concise final answer summarizing what you did."""
+
+# Week 6 Agent Loop Notes
+# 1. When response.stop_reason == "tool_use", the model is asking the app to execute
+#    one or more tools before it can finish the answer.
+# 2. tool_use_id links each returned tool result to the exact tool call that produced it,
+#    so the model knows which output belongs to which request.
+# 3. Tool results are added back as a "user" role message because they become fresh
+#    context for the next model turn, similar to the environment reporting new facts.
+# 4. Without a max-iterations safeguard, a bad prompt or tool loop could keep calling
+#    tools forever and never return a final answer.
+
+tools = [
+    {
+        "name": "get_movies",
+        "description": "Get movies from the tracker. Optionally filter by status such as watched, watching, or want_to_watch.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "status": {
+                    "type": "string",
+                    "description": "Optional movie status filter. Use watched, watching, or want_to_watch.",
+                }
+            },
+            "required": [],
+        },
+    },
+    {
+        "name": "get_movie_by_id",
+        "description": "Get one saved movie by its numeric id when you already know which movie record to inspect.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "movie_id": {
+                    "type": "integer",
+                    "description": "The numeric id of the movie to retrieve.",
+                }
+            },
+            "required": ["movie_id"],
+        },
+    },
+    {
+        "name": "add_movie",
+        "description": "Add a new movie to the tracker with its title, director, genre, release year, and optional status or rating.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "title": {"type": "string", "description": "Movie title."},
+                "director": {"type": "string", "description": "Movie director."},
+                "genre": {"type": "string", "description": "Movie genre."},
+                "release_year": {
+                    "type": "integer",
+                    "description": "Movie release year as a four-digit number.",
+                },
+                "status": {
+                    "type": "string",
+                    "description": "Optional status. Use watched, watching, or want_to_watch.",
+                },
+                "rating": {
+                    "type": "integer",
+                    "description": "Optional user rating from 1 to 5.",
+                },
+            },
+            "required": ["title", "director", "genre", "release_year"],
+        },
+    },
+    {
+        "name": "update_movie_status",
+        "description": "Update an existing movie's status and optionally set its rating when the user says they started, finished, or rated a movie.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "movie_id": {
+                    "type": "integer",
+                    "description": "The numeric id of the movie to update.",
+                },
+                "status": {
+                    "type": "string",
+                    "description": "New movie status. Use watched, watching, or want_to_watch.",
+                },
+                "rating": {
+                    "type": "integer",
+                    "description": "Optional new rating from 1 to 5.",
+                },
+            },
+            "required": ["movie_id", "status"],
+        },
+    },
+    {
+        "name": "delete_movie",
+        "description": "Delete a movie from the tracker when the user wants to remove it from their collection.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "movie_id": {
+                    "type": "integer",
+                    "description": "The numeric id of the movie to delete.",
+                }
+            },
+            "required": ["movie_id"],
+        },
+    },
+]
 
 
 def seed_database():
@@ -182,12 +292,150 @@ def build_history_payload(request: ChatRequest) -> list[dict[str, str]]:
 def request_claude_reply(messages: list[dict[str, str]], system_prompt: str) -> str:
     ensure_ai_key()
     response = ai_client.messages.create(
-        model="claude-sonnet-4-20250514",
+        model="claude-sonnet-4-6",
         max_tokens=1024,
         system=system_prompt,
         messages=messages,
     )
     return response.content[0].text
+
+
+def serialize_movie(movie: Movie) -> dict[str, int | str | None]:
+    return {
+        "id": movie.id,
+        "title": movie.title,
+        "director": movie.director,
+        "status": movie.status,
+        "genre": movie.genre,
+        "release_year": movie.release_year,
+        "rating": movie.rating,
+    }
+
+
+def get_movies_fn(db: Session, status: str | None = None) -> list[dict[str, int | str | None]]:
+    query = db.query(Movie)
+    if status:
+        query = query.filter(Movie.status == status)
+    movies = query.order_by(Movie.id.asc()).all()
+    return [serialize_movie(movie) for movie in movies]
+
+
+def get_movie_by_id_fn(db: Session, movie_id: int) -> dict[str, int | str | None]:
+    movie = db.query(Movie).filter(Movie.id == movie_id).first()
+    if movie is None:
+        return {"error": "Movie not found", "movie_id": movie_id}
+    return serialize_movie(movie)
+
+
+def add_movie_fn(
+    db: Session,
+    title: str,
+    director: str,
+    genre: str,
+    release_year: int,
+    status: str = "want_to_watch",
+    rating: int | None = None,
+) -> dict[str, int | str | None]:
+    movie = Movie(
+        title=title,
+        director=director,
+        genre=genre,
+        release_year=release_year,
+        status=status,
+        rating=rating,
+    )
+    db.add(movie)
+    db.commit()
+    db.refresh(movie)
+    return serialize_movie(movie)
+
+
+def update_movie_status_fn(
+    db: Session,
+    movie_id: int,
+    status: str,
+    rating: int | None = None,
+) -> dict[str, int | str | None]:
+    movie = db.query(Movie).filter(Movie.id == movie_id).first()
+    if movie is None:
+        return {"error": "Movie not found", "movie_id": movie_id}
+
+    movie.status = status
+    if rating is not None:
+        movie.rating = rating
+
+    db.commit()
+    db.refresh(movie)
+    return serialize_movie(movie)
+
+
+def delete_movie_fn(db: Session, movie_id: int) -> dict[str, int | str | bool]:
+    movie = db.query(Movie).filter(Movie.id == movie_id).first()
+    if movie is None:
+        return {"error": "Movie not found", "movie_id": movie_id}
+
+    title = movie.title
+    db.delete(movie)
+    db.commit()
+    return {"success": True, "movie_id": movie_id, "title": title}
+
+
+def run_agent(
+    user_message: str,
+    tool_functions: dict[str, callable],
+    db: Session,
+    max_iterations: int = 5,
+) -> tuple[str, list[dict]]:
+    ensure_ai_key()
+    messages: list[dict] = [{"role": "user", "content": user_message}]
+    agent_steps: list[dict] = []
+
+    for _ in range(max_iterations):
+        response = ai_client.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=1024,
+            system=AGENT_SYSTEM_PROMPT,
+            messages=messages,
+            tools=tools,
+        )
+
+        if response.stop_reason != "tool_use":
+            final_text = "".join(
+                block.text for block in response.content if getattr(block, "type", None) == "text"
+            ).strip()
+            return final_text, agent_steps
+
+        assistant_blocks = []
+        tool_result_blocks = []
+
+        for block in response.content:
+            assistant_blocks.append(block)
+
+            if getattr(block, "type", None) != "tool_use":
+                continue
+
+            tool_name = block.name
+            tool_input = block.input
+            result = tool_functions[tool_name](db=db, **tool_input)
+            agent_steps.append(
+                {
+                    "tool": tool_name,
+                    "input": tool_input,
+                    "result": result,
+                }
+            )
+            tool_result_blocks.append(
+                {
+                    "type": "tool_result",
+                    "tool_use_id": block.id,
+                    "content": str(result),
+                }
+            )
+
+        messages.append({"role": "assistant", "content": assistant_blocks})
+        messages.append({"role": "user", "content": tool_result_blocks})
+
+    return "I reached the maximum number of tool steps before finishing the request.", agent_steps
 
 
 def build_movie_context(db: Session) -> str:
@@ -344,4 +592,20 @@ def get_recommendations(request: ChatRequest, db: Session = Depends(get_db)):
     return {
         "reply": reply,
         "updated_history": messages + [{"role": "assistant", "content": reply}],
+    }
+
+
+@app.post("/ai/agent")
+def movie_agent(request: AgentRequest, db: Session = Depends(get_db)):
+    tool_functions = {
+        "get_movies": get_movies_fn,
+        "get_movie_by_id": get_movie_by_id_fn,
+        "add_movie": add_movie_fn,
+        "update_movie_status": update_movie_status_fn,
+        "delete_movie": delete_movie_fn,
+    }
+    response_text, agent_steps = run_agent(request.message, tool_functions, db)
+    return {
+        "response": response_text,
+        "agent_steps": agent_steps,
     }

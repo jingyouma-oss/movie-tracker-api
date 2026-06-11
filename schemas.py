@@ -61,3 +61,7 @@ class ChatMessage(BaseModel):
 class ChatRequest(BaseModel):
     message: str
     conversation_history: list[ChatMessage] = []
+
+
+class AgentRequest(BaseModel):
+    message: str
