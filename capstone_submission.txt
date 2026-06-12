@@ -1,0 +1,21 @@
+Capstone Project: Movie Tracker AI Assistant
+Student: Jingyou Ma
+Course: CSE552 Full Stack Software Development in the Age of AI Agents
+
+Frontend GitHub repo:
+https://github.com/jingyouma-oss/movie-tracker-frontend
+
+Backend GitHub repo:
+https://github.com/jingyouma-oss/movie-tracker-api
+
+Short description:
+Movie Tracker AI Assistant is a full stack web application for managing a personal movie watchlist. It uses a Next.js frontend, a FastAPI backend, and a PostgreSQL database with related movie and review tables. Users can create, view, update, and delete movie records through the UI, and the app also includes AI-powered chat, personalized recommendations, and an agent endpoint that can call tools to manage the movie collection through natural language. This project demonstrates full stack CRUD development, database persistence, AI integration, and agentic tool use in one complete application.
+
+Suggested screenshots to submit:
+1. Movies list page showing saved records.
+2. Add movie form or movie detail page showing CRUD functionality.
+3. AI recommendation chat showing a personalized response.
+4. /docs response for POST /ai/agent showing agent_steps with multiple tool calls.
+
+One-sentence project highlight:
+I am most proud that this project turns a normal CRUD movie tracker into an AI-powered assistant that can recommend movies and take real actions through tool calls.
